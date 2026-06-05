@@ -1,578 +1,407 @@
 # =========================================================
-# REAL AUTO TRADING NIFTY OPTIONS BOT
-# ZERODHA KITE API
-# LIVE AUTO BUY + AUTO SELL
-# GOOGLE COLAB READY
+# PART 1: STREAMLIT APP CONFIGURATION & AUTHENTICATION
 # =========================================================
-
-# WARNING:
-# THIS IS REAL AUTO TRADING
-# REAL MONEY WILL BE USED
-# TEST WITH 1 LOT ONLY
-
-# =========================================================
-# INSTALL LIBRARIES
-# =========================================================
-
-!pip install kiteconnect pandas ta pytz -q
-
-# =========================================================
-# IMPORTS
-# =========================================================
-
-from kiteconnect import KiteConnect
+import streamlit as st
 import pandas as pd
-
+from kiteconnect import KiteConnect
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
-
 from datetime import datetime, timedelta
-
 import pytz
 import os
 import time
 
-# =========================================================
-# INDIA TIMEZONE
-# =========================================================
+# --- Page configuration ---
+st.set_page_config(
+    page_title="Nifty Options Bot Dashboard",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
+# --- India Timezone Setup ---
 os.environ['TZ'] = 'Asia/Kolkata'
-
 india = pytz.timezone('Asia/Kolkata')
 
 def get_indian_time():
-
     return datetime.now(india)
 
-# =========================================================
-# API DETAILS
-# =========================================================
+# --- Initialize Session State ---
+# Safely persist variables across Streamlit's structural re-runs
+if "kite" not in st.session_state:
+    st.session_state.kite = None
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "bot_running" not in st.session_state:
+    st.session_state.bot_running = False
+if "logs" not in st.session_state:
+    st.session_state.logs = []
 
+# Persistent variables for trading state
+trading_metrics = [
+    "position", "trade_side", "entry_price", "target_price",
+    "stoploss_price", "trade_count", "wins", "losses", 
+    "total_pnl", "current_option_symbol"
+]
+for metric in trading_metrics:
+    if metric not in st.session_state:
+        if metric in ["entry_price", "target_price", "stoploss_price", "total_pnl"]:
+            st.session_state[metric] = 0.0
+        elif metric in ["trade_count", "wins", "losses"]:
+            st.session_state[metric] = 0
+        else:
+            st.session_state[metric] = None
+
+# --- Static API Details ---
 API_KEY = "o6z9vadhlia8llh1"
-
 API_SECRET = "q7ierqpe1lv6b2lgmic58230iax2g22g"
 
-# =========================================================
-# LOGIN
-# =========================================================
+# Helper function to append application logs
+def add_log(message):
+    timestamp = get_indian_time().strftime("%H:%M:%S")
+    st.session_state.logs.append(f"[{timestamp}] {message}")
+    if len(st.session_state.logs) > 100:  # Keep last 100 entries
+        st.session_state.logs.pop(0)
 
-kite = KiteConnect(api_key=API_KEY)
+# --- Layout Structure ---
+st.title("🤖 Nifty Options Auto-Trading Bot")
+st.caption("Zerodha Kite API Live Auto Buy + Auto Sell Dashboard")
 
-print("\nLOGIN URL:")
-print(kite.login_url())
+# --- Sidebar: Authentication & Configuration Parameters ---
+with st.sidebar:
+    st.header("🔑 Authentication")
+    
+    if not st.session_state.logged_in:
+        try:
+            # Instantiate Kite Connection dynamically
+            temporary_kite = KiteConnect(api_key=API_KEY)
+            login_url = temporary_kite.login_url()
+            
+            st.markdown(f"[🔗 Click Here to Generate Request Token]({login_url})", unsafe_allow_html=True)
+            req_token = st.text_input("Enter Request Token:", type="password")
+            
+            if st.button("Authenticate & Log In", use_container_width=True):
+                if req_token:
+                    try:
+                        data = temporary_kite.generate_session(request_token=req_token.strip(), api_secret=API_SECRET)
+                        temporary_kite.set_access_token(data["access_token"])
+                        
+                        st.session_state.kite = temporary_kite
+                        st.session_state.logged_in = True
+                        add_log("✅ Login successful and authenticated.")
+                        st.rerun()
+                    except Exception as err:
+                        st.error(f"Authentication Failed: {err}")
+                else:
+                    st.warning("Please enter a valid request token.")
+        except Exception as e:
+            st.error(f"Error initializing Kite API: {e}")
+    else:
+        st.success("🔒 Authenticated & Connected")
+        if st.button("Log Out & Clear Session"):
+            st.session_state.logged_in = False
+            st.session_state.kite = None
+            st.session_state.bot_running = False
+            st.rerun()
 
-request_token = input(
-    "\nENTER REQUEST TOKEN: "
-).strip()
+    st.markdown("---")
+    st.header("⚙️ Strategy Parameters")
+    
+    # Interactive UI controls replacing the hardcoded script variables
+    INTERVAL = st.selectbox("Historical Data Interval", ["minute", "3minute", "5minute", "15minute"], index=1)
+    REFRESH_TIME = st.slider("Refresh Rate (seconds)", min_value=2, max_value=30, value=5)
+    LOT_SIZE = st.number_input("Lot Size (Qty)", min_value=1, value=65, step=1)
+    
+    col_param1, col_param2 = st.columns(2)
+    with col_param1:
+        TARGET_POINTS = st.number_input("Target (Pts)", min_value=1, value=8)
+        TRAIL_TRIGGER = st.number_input("Trail Trigger (Pts)", min_value=1, value=4)
+    with col_param2:
+        STOPLOSS_POINTS = st.number_input("Stoploss (Pts)", min_value=1, value=4)
+        MAX_TRADES_PER_DAY = st.number_input("Max Daily Trades", min_value=1, value=10)
+        
+    MAX_DAILY_LOSS = st.number_input("Max Daily Loss Limit (₹)", value=-3000, max_value=0, step=250)
+    INSTRUMENT_TOKEN = 256265  # Nifty 50 Continuous Instrument Token
 
-data = kite.generate_session(
-    request_token=request_token,
-    api_secret=API_SECRET
-)
-
-kite.set_access_token(
-    data["access_token"]
-)
-
-print("\n✅ LOGIN SUCCESSFUL")
-
-# =========================================================
-# SETTINGS
-# =========================================================
-
-INTERVAL = "3minute"
-
-REFRESH_TIME = 5
-
-LOT_SIZE = 65
-
-TARGET_POINTS = 8
-
-STOPLOSS_POINTS = 4
-
-TRAIL_TRIGGER = 4
-
-MAX_TRADES_PER_DAY = 10
-
-MAX_DAILY_LOSS = -3000
-
-# =========================================================
-# VARIABLES
-# =========================================================
-
-position = None
-
-trade_side = None
-
-entry_price = 0
-
-target_price = 0
-
-stoploss_price = 0
-
-trade_count = 0
-
-wins = 0
-
-losses = 0
-
-total_pnl = 0
-
-current_option_symbol = None
-
-instrument_token = 256265
-
-# =========================================================
-# FETCH NIFTY DATA
+    # =========================================================
+# PART 2: TRADING FUNCTIONS, DASHBOARD UI, & RUNTIME LOOP
 # =========================================================
 
+# --- Fetch Nifty Historical Data ---
 def get_data():
+    try:
+        to_date = get_indian_time()
+        from_date = to_date - timedelta(days=3)
+        
+        # Uses st.session_state.kite instead of a global object
+        data = st.session_state.kite.historical_data(
+            instrument_token=INSTRUMENT_TOKEN,
+            from_date=from_date,
+            to_date=to_date,
+            interval=INTERVAL
+        )
+        return pd.DataFrame(data)
+    except Exception as e:
+        add_log(f"⚠️ Error fetching historical data: {e}")
+        return pd.DataFrame()
 
-    to_date = get_indian_time()
-
-    from_date = (
-        to_date - timedelta(days=3)
-    )
-
-    data = kite.historical_data(
-
-        instrument_token=instrument_token,
-
-        from_date=from_date,
-
-        to_date=to_date,
-
-        interval=INTERVAL
-    )
-
-    df = pd.DataFrame(data)
-
-    return df
-
-# =========================================================
-# APPLY INDICATORS
-# =========================================================
-
+# --- Apply Indicators ---
 def apply_indicators(df):
+    if df.empty:
+        return df
+    try:
+        ema9 = EMAIndicator(close=df['close'], window=9)
+        ema21 = EMAIndicator(close=df['close'], window=21)
+        df['EMA9'] = ema9.ema_indicator()
+        df['EMA21'] = ema21.ema_indicator()
 
-    ema9 = EMAIndicator(
-        close=df['close'],
-        window=9
-    )
+        macd = MACD(close=df['close'])
+        df['MACD'] = macd.macd()
+        df['SIGNAL'] = macd.macd_signal()
 
-    ema21 = EMAIndicator(
-        close=df['close'],
-        window=21
-    )
-
-    df['EMA9'] = ema9.ema_indicator()
-
-    df['EMA21'] = ema21.ema_indicator()
-
-    macd = MACD(close=df['close'])
-
-    df['MACD'] = macd.macd()
-
-    df['SIGNAL'] = macd.macd_signal()
-
-    rsi = RSIIndicator(close=df['close'])
-
-    df['RSI'] = rsi.rsi()
-
+        rsi = RSIIndicator(close=df['close'])
+        df['RSI'] = rsi.rsi()
+    except Exception as e:
+        add_log(f"⚠️ Error applying indicators: {e}")
     return df
 
-# =========================================================
-# SIGNAL
-# =========================================================
-
+# --- Signal Generator ---
 def generate_signal(df):
-
+    if df.empty or len(df) < 2:
+        return "HOLD"
+    
     latest = df.iloc[-1]
-
     bullish = (
-
-        latest['EMA9']
-        > latest['EMA21']
-
-        and (
-            latest['MACD']
-            - latest['SIGNAL']
-        ) > -0.5
-
-        and latest['RSI'] > 48
+        latest['EMA9'] > latest['EMA21'] and 
+        (latest['MACD'] - latest['SIGNAL']) > -0.5 and 
+        latest['RSI'] > 48
     )
-
     bearish = (
-
-        latest['EMA9']
-        < latest['EMA21']
-
-        and (
-            latest['MACD']
-            - latest['SIGNAL']
-        ) < 0.5
-
-        and latest['RSI'] < 52
+        latest['EMA9'] < latest['EMA21'] and 
+        (latest['MACD'] - latest['SIGNAL']) < 0.5 and 
+        latest['RSI'] < 52
     )
 
     if bullish:
-
         return "CALL"
-
     elif bearish:
-
         return "PUT"
+    return "HOLD"
 
-    else:
-
-        return "HOLD"
-
-# =========================================================
-# GET ATM OPTION
-# =========================================================
-
+# --- Dynamic ATM Option Selector ---
 def get_option_symbol(signal):
-
-    ltp = kite.ltp("NSE:NIFTY 50")
-
-    nifty_price = ltp[
-        "NSE:NIFTY 50"
-    ]['last_price']
-
-    strike = round(
-        nifty_price / 50
-    ) * 50
-
-    instruments = kite.instruments("NFO")
-
-    expiry = None
-
-    for item in instruments:
-
-        if (
-            item['name'] == 'NIFTY'
-            and item['segment'] == 'NFO-OPT'
-        ):
-
-            expiry = item['expiry']
-
-            break
-
-    option_type = "CE"
-
-    if signal == "PUT":
-
-        option_type = "PE"
-
-    option_symbol = None
-
-    for item in instruments:
-
-        if (
-            item['name'] == 'NIFTY'
-            and item['segment'] == 'NFO-OPT'
-            and item['strike'] == strike
-            and item['instrument_type'] == option_type
-            and item['expiry'] == expiry
-        ):
-
-            option_symbol = item['tradingsymbol']
-
-            break
-
-    return option_symbol
-
-# =========================================================
-# PLACE BUY ORDER
-# =========================================================
-
-def place_buy_order(symbol):
-
-    order_id = kite.place_order(
-
-        variety=kite.VARIETY_REGULAR,
-
-        exchange=kite.EXCHANGE_NFO,
-
-        tradingsymbol=symbol,
-
-        transaction_type=kite.TRANSACTION_TYPE_BUY,
-
-        quantity=LOT_SIZE,
-
-        order_type=kite.ORDER_TYPE_MARKET,
-
-        product=kite.PRODUCT_MIS
-    )
-
-    return order_id
-
-# =========================================================
-# PLACE SELL ORDER
-# =========================================================
-
-def place_sell_order(symbol):
-
-    order_id = kite.place_order(
-
-        variety=kite.VARIETY_REGULAR,
-
-        exchange=kite.EXCHANGE_NFO,
-
-        tradingsymbol=symbol,
-
-        transaction_type=kite.TRANSACTION_TYPE_SELL,
-
-        quantity=LOT_SIZE,
-
-        order_type=kite.ORDER_TYPE_MARKET,
-
-        product=kite.PRODUCT_MIS
-    )
-
-    return order_id
-
-# =========================================================
-# START BOT
-# =========================================================
-
-print("\n======================================")
-print(" REAL AUTO TRADING BOT STARTED ")
-print("======================================")
-
-while True:
-
     try:
-
-        if total_pnl <= MAX_DAILY_LOSS:
-
-            print("\n❌ MAX DAILY LOSS HIT")
-
-            break
-
-        if trade_count >= MAX_TRADES_PER_DAY:
-
-            print("\n✅ MAX TRADES REACHED")
-
-            break
-
-        # LIVE NIFTY PRICE
-        ltp_data = kite.ltp(
-            "NSE:NIFTY 50"
-        )
-
-        current_price = ltp_data[
-            "NSE:NIFTY 50"
-        ]['last_price']
-
-        # FETCH DATA
-        df = get_data()
-
-        df = apply_indicators(df)
-
-        latest = df.iloc[-1]
-
-        signal = generate_signal(df)
-
-        print("\n======================================")
-
-        print("TIME:",
-              get_indian_time())
-
-        print("NIFTY:",
-              current_price)
-
-        print("EMA9:",
-              round(latest['EMA9'], 2))
-
-        print("EMA21:",
-              round(latest['EMA21'], 2))
-
-        print("MACD:",
-              round(latest['MACD'], 2))
-
-        print("SIGNAL:",
-              round(latest['SIGNAL'], 2))
-
-        print("RSI:",
-              round(latest['RSI'], 2))
-
-        print("BOT SIGNAL:",
-              signal)
-
-        # =================================================
-        # ENTRY
-        # =================================================
-
-        if position is None:
-
-            if signal in ["CALL", "PUT"]:
-
-                option_symbol = get_option_symbol(signal)
-
-                if option_symbol:
-
-                    current_option_symbol = option_symbol
-
-                    order_id = place_buy_order(
-                        option_symbol
-                    )
-
-                    option_ltp = kite.ltp(
-                        f"NFO:{option_symbol}"
-                    )
-
-                    entry_price = option_ltp[
-                        f"NFO:{option_symbol}"
-                    ]['last_price']
-
-                    position = "OPEN"
-
-                    trade_side = signal
-
-                    target_price = (
-                        entry_price
-                        + TARGET_POINTS
-                    )
-
-                    stoploss_price = (
-                        entry_price
-                        - STOPLOSS_POINTS
-                    )
-
-                    trade_count += 1
-
-                    print("\n🟢 BUY ORDER EXECUTED")
-
-                    print("OPTION:",
-                          option_symbol)
-
-                    print("ENTRY:",
-                          entry_price)
-
-                    print("TARGET:",
-                          target_price)
-
-                    print("STOPLOSS:",
-                          stoploss_price)
-
-        # =================================================
-        # POSITION MANAGEMENT
-        # =================================================
-
-        else:
-
-            option_ltp = kite.ltp(
-                f"NFO:{current_option_symbol}"
-            )
-
-            live_option_price = option_ltp[
-                f"NFO:{current_option_symbol}"
-            ]['last_price']
-
-            pnl_points = (
-                live_option_price
-                - entry_price
-            )
-
-            pnl = pnl_points * LOT_SIZE
-
-            print("\nLIVE OPTION PRICE:",
-                  live_option_price)
-
-            print("LIVE PnL:",
-                  round(pnl, 2))
-
-            # TRAILING SL
-            if pnl_points >= TRAIL_TRIGGER:
-
-                stoploss_price = entry_price
-
-            if pnl_points >= 6:
-
-                stoploss_price = (
-                    entry_price + 3
-                )
-
-            print("TRAIL SL:",
-                  round(stoploss_price, 2))
-
-            # TARGET
-            if live_option_price >= target_price:
-
-                order_id = place_sell_order(
-                    current_option_symbol
-                )
-
-                wins += 1
-
-                total_pnl += pnl
-
-                print("\n✅ TARGET HIT")
-
-                print("SELL ORDER:",
-                      order_id)
-
-                print("BOOKED PnL:",
-                      round(pnl, 2))
-
-                position = None
-
-            # STOPLOSS
-            elif live_option_price <= stoploss_price:
-
-                order_id = place_sell_order(
-                    current_option_symbol
-                )
-
-                losses += 1
-
-                total_pnl += pnl
-
-                print("\n❌ STOPLOSS HIT")
-
-                print("SELL ORDER:",
-                      order_id)
-
-                print("BOOKED PnL:",
-                      round(pnl, 2))
-
-                position = None
-
-        # =================================================
-        # SUMMARY
-        # =================================================
-
-        print("\n======================================")
-
-        print("TOTAL TRADES:",
-              trade_count)
-
-        print("WINS:",
-              wins)
-
-        print("LOSSES:",
-              losses)
-
-        if trade_count > 0:
-
-            win_rate = (
-                wins / trade_count
-            ) * 100
-
-            print("WIN RATE:",
-                  round(win_rate, 2),
-                  "%")
-
-        print("TOTAL PnL:",
-              round(total_pnl, 2))
-
-        print("======================================")
-
-        time.sleep(REFRESH_TIME)
-
+        ltp = st.session_state.kite.ltp("NSE:NIFTY 50")
+        nifty_price = ltp["NSE:NIFTY 50"]['last_price']
+        strike = round(nifty_price / 50) * 50
+
+        instruments = st.session_state.kite.instruments("NFO")
+        
+        expiry = None
+        for item in instruments:
+            if item['name'] == 'NIFTY' and item['segment'] == 'NFO-OPT':
+                expiry = item['expiry']
+                break
+
+        option_type = "CE" if signal == "CALL" else "PE"
+        
+        for item in instruments:
+            if (item['name'] == 'NIFTY' and 
+                item['segment'] == 'NFO-OPT' and 
+                item['strike'] == strike and 
+                item['instrument_type'] == option_type and 
+                item['expiry'] == expiry):
+                return item['tradingsymbol']
     except Exception as e:
+        add_log(f"⚠️ Error parsing option contract: {e}")
+    return None
 
-        print("\nERROR:", e)
+# --- Order Functions ---
+def place_order(symbol, transaction_type):
+    try:
+        order_id = st.session_state.kite.place_order(
+            variety=st.session_state.kite.VARIETY_REGULAR,
+            exchange=st.session_state.kite.EXCHANGE_NFO,
+            tradingsymbol=symbol,
+            transaction_type=transaction_type,
+            quantity=int(LOT_SIZE),
+            order_type=st.session_state.kite.ORDER_TYPE_MARKET,
+            product=st.session_state.kite.PRODUCT_MIS
+        )
+        return order_id
+    except Exception as e:
+        add_log(f"❌ Order Placement Error ({transaction_type}): {e}")
+        return None
 
-        time.sleep(10)
+# =========================================================
+# MAIN DASHBOARD INTERFACE LAYOUT
+# =========================================================
+
+# Main layout action buttons
+col_ctrl1, col_ctrl2 = st.columns(2)
+with col_ctrl1:
+    if st.button("▶️ START BOT", key="start_btn", disabled=not st.session_state.logged_in or st.session_state.bot_running, use_container_width=True):
+        st.session_state.bot_running = True
+        add_log("🤖 Algo Engine Started.")
+        st.rerun()
+
+with col_ctrl2:
+    if st.button("⏸️ STOP BOT", key="stop_btn", disabled=not st.session_state.bot_running, use_container_width=True):
+        st.session_state.bot_running = False
+        add_log("🛑 Algo Engine Stopped Manually.")
+        st.rerun()
+
+# --- Performance Metrics Cards ---
+st.markdown("### 📊 Live Performance Summary")
+m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+
+win_rate = 0.0
+if st.session_state.trade_count > 0:
+    win_rate = round((st.session_state.wins / st.session_state.trade_count) * 100, 2)
+
+m_col1.metric("Total Trades", st.session_state.trade_count)
+m_col2.metric("Wins / Losses", f"🟢 {st.session_state.wins} / 🔴 {st.session_state.losses}")
+m_col3.metric("Win Rate", f"{win_rate}%")
+m_col4.metric("Total Realized PnL", f"₹ {round(st.session_state.total_pnl, 2)}")
+
+# --- Split Workspace Layout ---
+left_view, right_view = st.columns([2, 1])
+
+with left_view:
+    st.markdown("### 📈 Live Telemetry & Open Positions")
+    active_pos_container = st.empty()
+    technical_container = st.empty()
+
+with right_view:
+    st.markdown("### 📜 Application Logs")
+    log_container = st.empty()
+
+# =========================================================
+# BACKGROUND LIVE EXECUTION ENGINE LOOP
+# =========================================================
+if st.session_state.bot_running and st.session_state.logged_in:
+    try:
+        # Risk & Boundary Checks
+        if st.session_state.total_pnl <= MAX_DAILY_LOSS:
+            add_log("🛑 Critical: MAX DAILY LOSS LIMIT HIT. Halting systems.")
+            st.session_state.bot_running = False
+            st.rerun()
+
+        if st.session_state.trade_count >= MAX_TRADES_PER_DAY:
+            add_log("🛑 Alert: Max daily targeted trade limits satisfied.")
+            st.session_state.bot_running = False
+            st.rerun()
+
+        # Gather Pipeline Telemetry
+        ltp_data = st.session_state.kite.ltp("NSE:NIFTY 50")
+        current_price = ltp_data["NSE:NIFTY 50"]['last_price']
+        
+        df_raw = get_data()
+        df_ind = apply_indicators(df_raw)
+        
+        bot_signal = "HOLD"
+        latest_row = {}
+        if not df_ind.empty:
+            latest_row = df_ind.iloc[-1]
+            bot_signal = generate_signal(df_ind)
+
+        # 1. Update Technical Telemetry View Dashboard
+        with technical_container.container():
+            st.write(f"**Spot Index Price (NIFTY 50):** `{current_price}`")
+            if len(latest_row) > 0:
+                t_col1, t_col2, t_col3 = st.columns(3)
+                t_col1.metric("EMA 9 / 21", f"{round(latest_row['EMA9'], 2)} / {round(latest_row['EMA21'],2)}")
+                t_col2.metric("MACD / Signal Line", f"{round(latest_row['MACD'], 2)} / {round(latest_row['SIGNAL'],2)}")
+                t_col3.metric("RSI Value", round(latest_row['RSI'], 2))
+            st.info(f"⚡ Current Strategy Matrix Engine Signal: **{bot_signal}**")
+
+        # 2. Position Core State Management Machine Flow
+        if st.session_state.position is None:
+            with active_pos_container.container():
+                st.warning("⚠️ No Active Position Open.")
+            
+            # Entry Handler Block
+            if bot_signal in ["CALL", "PUT"]:
+                opt_sym = get_option_symbol(bot_signal)
+                if opt_sym:
+                    order_id = place_order(opt_sym, st.session_state.kite.TRANSACTION_TYPE_BUY)
+                    if order_id:
+                        opt_ltp_data = st.session_state.kite.ltp(f"NFO:{opt_sym}")
+                        entry_ltp = opt_ltp_data[f"NFO:{opt_sym}"]['last_price']
+                        
+                        st.session_state.current_option_symbol = opt_sym
+                        st.session_state.entry_price = entry_ltp
+                        st.session_state.target_price = entry_ltp + TARGET_POINTS
+                        st.session_state.stoploss_price = entry_ltp - STOPLOSS_POINTS
+                        st.session_state.trade_side = bot_signal
+                        st.session_state.position = "OPEN"
+                        st.session_state.trade_count += 1
+                        
+                        add_log(f"🟢 Long Entry Open: Bought {opt_sym} at ₹{entry_ltp}")
+                        st.rerun()
+        else:
+            # Inside Active Position Block
+            opt_symbol = st.session_state.current_option_symbol
+            opt_ltp_data = st.session_state.kite.ltp(f"NFO:{opt_symbol}")
+            live_opt_price = opt_ltp_data[f"NFO:{opt_symbol}"]['last_price']
+            
+            pnl_points = live_opt_price - st.session_state.entry_price
+            current_pnl = pnl_points * LOT_SIZE
+
+            # Dynamic Trailing SL Logic Adjustments
+            if pnl_points >= TRAIL_TRIGGER:
+                if st.session_state.stoploss_price < st.session_state.entry_price:
+                    st.session_state.stoploss_price = st.session_state.entry_price
+                    add_log(f"🔄 Trailing SL moved to entry price: ₹{st.session_state.entry_price}")
+            
+            if pnl_points >= 6:
+                if st.session_state.stoploss_price < (st.session_state.entry_price + 3):
+                    st.session_state.stoploss_price = st.session_state.entry_price + 3
+                    add_log(f"🔄 Trailing SL locked in green (+3 pts): ₹{st.session_state.stoploss_price}")
+
+            with active_pos_container.container():
+                st.success(f"📌 ACTIVE POSITION: {opt_symbol} ({st.session_state.trade_side})")
+                ap_col1, ap_col2, ap_col3 = st.columns(3)
+                ap_col1.write(f"**Entry Price:** ₹{st.session_state.entry_price}")
+                ap_col1.write(f"**Current Price:** ₹{live_opt_price}")
+                ap_col2.write(f"**Target Price:** ₹{st.session_state.target_price}")
+                ap_col2.write(f"**Stop Loss:** ₹{round(st.session_state.stoploss_price, 2)}")
+                ap_col3.metric("Unrealized PnL", f"₹ {round(current_pnl, 2)}", delta=f"{round(pnl_points, 2)} pts")
+
+            # Exit Conditions (Target or Stop-Loss Hit)
+            if live_opt_price >= st.session_state.target_price:
+                order_id = place_order(opt_symbol, st.session_state.kite.TRANSACTION_TYPE_SELL)
+                if order_id:
+                    st.session_state.wins += 1
+                    st.session_state.total_pnl += current_pnl
+                    st.session_state.position = None
+                    add_log(f"✅ TARGET HIT: Closed {opt_symbol} for profit of ₹{round(current_pnl, 2)}")
+                    st.rerun()
+
+            elif live_opt_price <= st.session_state.stoploss_price:
+                order_id = place_order(opt_symbol, st.session_state.kite.TRANSACTION_TYPE_SELL)
+                if order_id:
+                    st.session_state.losses += 1
+                    st.session_state.total_pnl += current_pnl
+                    st.session_state.position = None
+                    add_log(f"❌ STOPLOSS HIT: Closed {opt_symbol} with PnL of ₹{round(current_pnl, 2)}")
+                    st.rerun()
+
+    except Exception as loops_err:
+        add_log(f"⚠️ Loop Exception Encountered: {loops_err}")
+
+    # Render Active Logs Container List
+    with log_container.container():
+        st.text_area("Live Event Ledger Log Window", value="\n".join(reversed(st.session_state.logs)), height=250, label_visibility="collapsed")
+
+    # Native Loop Throttle & Automated Interface Refresh Trigger
+    time.sleep(REFRESH_TIME)
+    st.rerun()
+else:
+    # Handle Display State when Strategy is Paused
+    with technical_container.container():
+        st.info("💡 Bot is idling. Connect session parameters and click 'START BOT' to begin live tracking.")
+    with log_container.container():
+        st.text_area("Live Event Ledger Log Window", value="\n".join(reversed(st.session_state.logs)), height=250, label_visibility="collapsed")
+
+        
