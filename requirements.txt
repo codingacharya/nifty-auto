@@ -1,0 +1,8 @@
+streamlit
+kiteconnect
+pandas
+pandas-ta
+numpy
+plotly
+pyarrow
+openpyxl
