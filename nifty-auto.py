@@ -27,7 +27,6 @@ def get_indian_time():
     return datetime.now(india)
 
 # --- Initialize Session State ---
-# Safely persist variables across Streamlit's structural re-runs
 if "kite" not in st.session_state:
     st.session_state.kite = None
 if "logged_in" not in st.session_state:
@@ -73,7 +72,6 @@ with st.sidebar:
     
     if not st.session_state.logged_in:
         try:
-            # Instantiate Kite Connection dynamically
             temporary_kite = KiteConnect(api_key=API_KEY)
             login_url = temporary_kite.login_url()
             
@@ -107,7 +105,6 @@ with st.sidebar:
     st.markdown("---")
     st.header("⚙️ Strategy Parameters")
     
-    # Interactive UI controls replacing the hardcoded script variables
     INTERVAL = st.selectbox("Historical Data Interval", ["minute", "3minute", "5minute", "15minute"], index=1)
     REFRESH_TIME = st.slider("Refresh Rate (seconds)", min_value=2, max_value=30, value=5)
     LOT_SIZE = st.number_input("Lot Size (Qty)", min_value=1, value=65, step=1)
@@ -121,8 +118,8 @@ with st.sidebar:
         MAX_TRADES_PER_DAY = st.number_input("Max Daily Trades", min_value=1, value=10)
         
     MAX_DAILY_LOSS = st.number_input("Max Daily Loss Limit (₹)", value=-3000, max_value=0, step=250)
-    INSTRUMENT_TOKEN = 256265  # Nifty 50 Continuous Instrument Token
-
+    SLIPPAGE_POINTS = st.number_input("Market Protection Limit Slippage (Pts)", value=2.0, step=0.5)
+    INSTRUMENT_TOKEN = 256265
     # =========================================================
 # PART 2: TRADING FUNCTIONS, DASHBOARD UI, & RUNTIME LOOP
 # =========================================================
@@ -133,7 +130,6 @@ def get_data():
         to_date = get_indian_time()
         from_date = to_date - timedelta(days=3)
         
-        # Uses st.session_state.kite instead of a global object
         data = st.session_state.kite.historical_data(
             instrument_token=INSTRUMENT_TOKEN,
             from_date=from_date,
@@ -142,7 +138,7 @@ def get_data():
         )
         return pd.DataFrame(data)
     except Exception as e:
-        add_log(f"⚠️ Error fetching historical data: {e}")
+        add_log(f"⚠️ Error fetching historical data (Likely API overload): {e}")
         return pd.DataFrame()
 
 # --- Apply Indicators ---
@@ -192,6 +188,9 @@ def generate_signal(df):
 def get_option_symbol(signal):
     try:
         ltp = st.session_state.kite.ltp("NSE:NIFTY 50")
+        if not ltp or "NSE:NIFTY 50" not in ltp:
+            return None
+            
         nifty_price = ltp["NSE:NIFTY 50"]['last_price']
         strike = round(nifty_price / 50) * 50
 
@@ -216,16 +215,25 @@ def get_option_symbol(signal):
         add_log(f"⚠️ Error parsing option contract: {e}")
     return None
 
-# --- Order Functions ---
-def place_order(symbol, transaction_type):
+# --- Fixed Limit Order Execution (Acts like Market Protection) ---
+def place_order(symbol, transaction_type, live_price):
     try:
+        # Calculate localized execution protection buffer
+        if transaction_type == st.session_state.kite.TRANSACTION_TYPE_BUY:
+            execution_price = round(live_price + float(SLIPPAGE_POINTS), 1)
+        else:
+            execution_price = round(live_price - float(SLIPPAGE_POINTS), 1)
+            if execution_price <= 0:
+                execution_price = 0.5 # Avoid zero/negative edge conditions
+
         order_id = st.session_state.kite.place_order(
             variety=st.session_state.kite.VARIETY_REGULAR,
             exchange=st.session_state.kite.EXCHANGE_NFO,
             tradingsymbol=symbol,
             transaction_type=transaction_type,
             quantity=int(LOT_SIZE),
-            order_type=st.session_state.kite.ORDER_TYPE_MARKET,
+            order_type=st.session_state.kite.ORDER_TYPE_LIMIT, # Replaced pure MARKET type
+            price=execution_price,                             # Set defined slippage edge limit
             product=st.session_state.kite.PRODUCT_MIS
         )
         return order_id
@@ -237,7 +245,6 @@ def place_order(symbol, transaction_type):
 # MAIN DASHBOARD INTERFACE LAYOUT
 # =========================================================
 
-# Main layout action buttons
 col_ctrl1, col_ctrl2 = st.columns(2)
 with col_ctrl1:
     if st.button("▶️ START BOT", key="start_btn", disabled=not st.session_state.logged_in or st.session_state.bot_running, use_container_width=True):
@@ -251,7 +258,6 @@ with col_ctrl2:
         add_log("🛑 Algo Engine Stopped Manually.")
         st.rerun()
 
-# --- Performance Metrics Cards ---
 st.markdown("### 📊 Live Performance Summary")
 m_col1, m_col2, m_col3, m_col4 = st.columns(4)
 
@@ -264,7 +270,6 @@ m_col2.metric("Wins / Losses", f"🟢 {st.session_state.wins} / 🔴 {st.session
 m_col3.metric("Win Rate", f"{win_rate}%")
 m_col4.metric("Total Realized PnL", f"₹ {round(st.session_state.total_pnl, 2)}")
 
-# --- Split Workspace Layout ---
 left_view, right_view = st.columns([2, 1])
 
 with left_view:
@@ -281,7 +286,6 @@ with right_view:
 # =========================================================
 if st.session_state.bot_running and st.session_state.logged_in:
     try:
-        # Risk & Boundary Checks
         if st.session_state.total_pnl <= MAX_DAILY_LOSS:
             add_log("🛑 Critical: MAX DAILY LOSS LIMIT HIT. Halting systems.")
             st.session_state.bot_running = False
@@ -292,116 +296,117 @@ if st.session_state.bot_running and st.session_state.logged_in:
             st.session_state.bot_running = False
             st.rerun()
 
-        # Gather Pipeline Telemetry
+        # Gather Pipeline Telemetry with Safe Server Network Error Boundaries
         ltp_data = st.session_state.kite.ltp("NSE:NIFTY 50")
-        current_price = ltp_data["NSE:NIFTY 50"]['last_price']
         
-        df_raw = get_data()
-        df_ind = apply_indicators(df_raw)
-        
-        bot_signal = "HOLD"
-        latest_row = {}
-        if not df_ind.empty:
-            latest_row = df_ind.iloc[-1]
-            bot_signal = generate_signal(df_ind)
-
-        # 1. Update Technical Telemetry View Dashboard
-        with technical_container.container():
-            st.write(f"**Spot Index Price (NIFTY 50):** `{current_price}`")
-            if len(latest_row) > 0:
-                t_col1, t_col2, t_col3 = st.columns(3)
-                t_col1.metric("EMA 9 / 21", f"{round(latest_row['EMA9'], 2)} / {round(latest_row['EMA21'],2)}")
-                t_col2.metric("MACD / Signal Line", f"{round(latest_row['MACD'], 2)} / {round(latest_row['SIGNAL'],2)}")
-                t_col3.metric("RSI Value", round(latest_row['RSI'], 2))
-            st.info(f"⚡ Current Strategy Matrix Engine Signal: **{bot_signal}**")
-
-        # 2. Position Core State Management Machine Flow
-        if st.session_state.position is None:
-            with active_pos_container.container():
-                st.warning("⚠️ No Active Position Open.")
+        if ltp_data and "NSE:NIFTY 50" in ltp_data:
+            current_price = ltp_data["NSE:NIFTY 50"]['last_price']
+            df_raw = get_data()
+            df_ind = apply_indicators(df_raw)
             
-            # Entry Handler Block
-            if bot_signal in ["CALL", "PUT"]:
-                opt_sym = get_option_symbol(bot_signal)
-                if opt_sym:
-                    order_id = place_order(opt_sym, st.session_state.kite.TRANSACTION_TYPE_BUY)
-                    if order_id:
-                        opt_ltp_data = st.session_state.kite.ltp(f"NFO:{opt_sym}")
-                        entry_ltp = opt_ltp_data[f"NFO:{opt_sym}"]['last_price']
-                        
-                        st.session_state.current_option_symbol = opt_sym
-                        st.session_state.entry_price = entry_ltp
-                        st.session_state.target_price = entry_ltp + TARGET_POINTS
-                        st.session_state.stoploss_price = entry_ltp - STOPLOSS_POINTS
-                        st.session_state.trade_side = bot_signal
-                        st.session_state.position = "OPEN"
-                        st.session_state.trade_count += 1
-                        
-                        add_log(f"🟢 Long Entry Open: Bought {opt_sym} at ₹{entry_ltp}")
-                        st.rerun()
+            bot_signal = "HOLD"
+            latest_row = {}
+            if not df_ind.empty:
+                latest_row = df_ind.iloc[-1]
+                bot_signal = generate_signal(df_ind)
+
+            # 1. Update Dashboard Indicators
+            with technical_container.container():
+                st.write(f"**Spot Index Price (NIFTY 50):** `{current_price}`")
+                if len(latest_row) > 0:
+                    t_col1, t_col2, t_col3 = st.columns(3)
+                    t_col1.metric("EMA 9 / 21", f"{round(latest_row['EMA9'], 2)} / {round(latest_row['EMA21'],2)}")
+                    t_col2.metric("MACD / Signal Line", f"{round(latest_row['MACD'], 2)} / {round(latest_row['SIGNAL'],2)}")
+                    t_col3.metric("RSI Value", round(latest_row['RSI'], 2))
+                st.info(f"⚡ Current Strategy Matrix Engine Signal: **{bot_signal}**")
+
+            # 2. Position Engine Core State Machine Flow
+            if st.session_state.position is None:
+                with active_pos_container.container():
+                    st.warning("⚠️ No Active Position Open.")
+                
+                # Entry Handler
+                if bot_signal in ["CALL", "PUT"]:
+                    opt_sym = get_option_symbol(bot_signal)
+                    if opt_sym:
+                        opt_ltp_raw = st.session_state.kite.ltp(f"NFO:{opt_sym}")
+                        if opt_ltp_raw and f"NFO:{opt_sym}" in opt_ltp_raw:
+                            approx_ltp = opt_ltp_raw[f"NFO:{opt_sym}"]['last_price']
+                            
+                            order_id = place_order(opt_sym, st.session_state.kite.TRANSACTION_TYPE_BUY, approx_ltp)
+                            if order_id:
+                                st.session_state.current_option_symbol = opt_sym
+                                st.session_state.entry_price = approx_ltp
+                                st.session_state.target_price = approx_ltp + TARGET_POINTS
+                                st.session_state.stoploss_price = approx_ltp - STOPLOSS_POINTS
+                                st.session_state.trade_side = bot_signal
+                                st.session_state.position = "OPEN"
+                                st.session_state.trade_count += 1
+                                
+                                add_log(f"🟢 Long Entry Open: Bought Limit Protected {opt_sym} near ₹{approx_ltp}")
+                                st.rerun()
+            else:
+                # Inside Active Position Management State
+                opt_symbol = st.session_state.current_option_symbol
+                opt_ltp_data = st.session_state.kite.ltp(f"NFO:{opt_symbol}")
+                
+                if opt_ltp_data and f"NFO:{opt_symbol}" in opt_ltp_data:
+                    live_opt_price = opt_ltp_data[f"NFO:{opt_symbol}"]['last_price']
+                    
+                    pnl_points = live_opt_price - st.session_state.entry_price
+                    current_pnl = pnl_points * LOT_SIZE
+
+                    # Dynamic Trailing SL Logic Adjustments
+                    if pnl_points >= TRAIL_TRIGGER:
+                        if st.session_state.stoploss_price < st.session_state.entry_price:
+                            st.session_state.stoploss_price = st.session_state.entry_price
+                            add_log(f"🔄 Trailing SL moved to entry price: ₹{st.session_state.entry_price}")
+                    
+                    if pnl_points >= 6:
+                        if st.session_state.stoploss_price < (st.session_state.entry_price + 3):
+                            st.session_state.stoploss_price = st.session_state.entry_price + 3
+                            add_log(f"🔄 Trailing SL locked in green (+3 pts): ₹{st.session_state.stoploss_price}")
+
+                    with active_pos_container.container():
+                        st.success(f"📌 ACTIVE POSITION: {opt_symbol} ({st.session_state.trade_side})")
+                        ap_col1, ap_col2, ap_col3 = st.columns(3)
+                        ap_col1.write(f"**Entry Price:** ₹{st.session_state.entry_price}")
+                        ap_col1.write(f"**Current Price:** ₹{live_opt_price}")
+                        ap_col2.write(f"**Target Price:** ₹{st.session_state.target_price}")
+                        ap_col2.write(f"**Stop Loss:** ₹{round(st.session_state.stoploss_price, 2)}")
+                        ap_col3.metric("Unrealized PnL", f"₹ {round(current_pnl, 2)}", delta=f"{round(pnl_points, 2)} pts")
+
+                    # Exit Engine Handling Block
+                    if live_opt_price >= st.session_state.target_price:
+                        order_id = place_order(opt_symbol, st.session_state.kite.TRANSACTION_TYPE_SELL, live_opt_price)
+                        if order_id:
+                            st.session_state.wins += 1
+                            st.session_state.total_pnl += current_pnl
+                            st.session_state.position = None
+                            add_log(f"✅ TARGET HIT: Closed {opt_symbol} for profit of ₹{round(current_pnl, 2)}")
+                            st.rerun()
+
+                    elif live_opt_price <= st.session_state.stoploss_price:
+                        order_id = place_order(opt_symbol, st.session_state.kite.TRANSACTION_TYPE_SELL, live_opt_price)
+                        if order_id:
+                            st.session_state.losses += 1
+                            st.session_state.total_pnl += current_pnl
+                            st.session_state.position = None
+                            add_log(f"❌ STOPLOSS HIT: Closed {opt_symbol} with PnL of ₹{round(current_pnl, 2)}")
+                            st.rerun()
         else:
-            # Inside Active Position Block
-            opt_symbol = st.session_state.current_option_symbol
-            opt_ltp_data = st.session_state.kite.ltp(f"NFO:{opt_symbol}")
-            live_opt_price = opt_ltp_data[f"NFO:{opt_symbol}"]['last_price']
-            
-            pnl_points = live_opt_price - st.session_state.entry_price
-            current_pnl = pnl_points * LOT_SIZE
-
-            # Dynamic Trailing SL Logic Adjustments
-            if pnl_points >= TRAIL_TRIGGER:
-                if st.session_state.stoploss_price < st.session_state.entry_price:
-                    st.session_state.stoploss_price = st.session_state.entry_price
-                    add_log(f"🔄 Trailing SL moved to entry price: ₹{st.session_state.entry_price}")
-            
-            if pnl_points >= 6:
-                if st.session_state.stoploss_price < (st.session_state.entry_price + 3):
-                    st.session_state.stoploss_price = st.session_state.entry_price + 3
-                    add_log(f"🔄 Trailing SL locked in green (+3 pts): ₹{st.session_state.stoploss_price}")
-
-            with active_pos_container.container():
-                st.success(f"📌 ACTIVE POSITION: {opt_symbol} ({st.session_state.trade_side})")
-                ap_col1, ap_col2, ap_col3 = st.columns(3)
-                ap_col1.write(f"**Entry Price:** ₹{st.session_state.entry_price}")
-                ap_col1.write(f"**Current Price:** ₹{live_opt_price}")
-                ap_col2.write(f"**Target Price:** ₹{st.session_state.target_price}")
-                ap_col2.write(f"**Stop Loss:** ₹{round(st.session_state.stoploss_price, 2)}")
-                ap_col3.metric("Unrealized PnL", f"₹ {round(current_pnl, 2)}", delta=f"{round(pnl_points, 2)} pts")
-
-            # Exit Conditions (Target or Stop-Loss Hit)
-            if live_opt_price >= st.session_state.target_price:
-                order_id = place_order(opt_symbol, st.session_state.kite.TRANSACTION_TYPE_SELL)
-                if order_id:
-                    st.session_state.wins += 1
-                    st.session_state.total_pnl += current_pnl
-                    st.session_state.position = None
-                    add_log(f"✅ TARGET HIT: Closed {opt_symbol} for profit of ₹{round(current_pnl, 2)}")
-                    st.rerun()
-
-            elif live_opt_price <= st.session_state.stoploss_price:
-                order_id = place_order(opt_symbol, st.session_state.kite.TRANSACTION_TYPE_SELL)
-                if order_id:
-                    st.session_state.losses += 1
-                    st.session_state.total_pnl += current_pnl
-                    st.session_state.position = None
-                    add_log(f"❌ STOPLOSS HIT: Closed {opt_symbol} with PnL of ₹{round(current_pnl, 2)}")
-                    st.rerun()
+            add_log("⚠️ Data synchronization warning. Zerodha servers unreachable or sluggish.")
 
     except Exception as loops_err:
-        add_log(f"⚠️ Loop Exception Encountered: {loops_err}")
+        add_log(f"⚠️ Loop Exception Encountered (Handled): {loops_err}")
 
-    # Render Active Logs Container List
     with log_container.container():
         st.text_area("Live Event Ledger Log Window", value="\n".join(reversed(st.session_state.logs)), height=250, label_visibility="collapsed")
 
-    # Native Loop Throttle & Automated Interface Refresh Trigger
     time.sleep(REFRESH_TIME)
     st.rerun()
 else:
-    # Handle Display State when Strategy is Paused
     with technical_container.container():
         st.info("💡 Bot is idling. Connect session parameters and click 'START BOT' to begin live tracking.")
     with log_container.container():
         st.text_area("Live Event Ledger Log Window", value="\n".join(reversed(st.session_state.logs)), height=250, label_visibility="collapsed")
-
-        
